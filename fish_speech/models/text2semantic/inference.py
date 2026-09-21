@@ -13,8 +13,8 @@ from typing import Callable, Literal, Optional, Tuple, Union
 import click
 import numpy as np
 import torch
-import torch._inductor.config
 from loguru import logger
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from tqdm import tqdm
 
 from fish_speech.content_sequence import (
@@ -22,23 +22,14 @@ from fish_speech.content_sequence import (
     VQPart,
 )
 from fish_speech.conversation import Conversation, Message
-from fish_speech.tokenizer import IM_END_TOKEN
-
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-torch._inductor.config.coordinate_descent_tuning = True
-torch._inductor.config.triton.unique_kernel_names = True
-
-if hasattr(torch._inductor.config, "fx_graph_cache"):
-    torch._inductor.config.fx_graph_cache = True
-
-
-from torch.nn.attention import SDPBackend, sdpa_kernel
-
 from fish_speech.models.text2semantic.llama import (
     BaseTransformer,
     DualARTransformer,
     NaiveTransformer,
 )
+from fish_speech.tokenizer import IM_END_TOKEN
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def multinomial_sample_one_no_sync(probs_sort):
@@ -381,10 +372,10 @@ def generate(
 
 
 def init_model(checkpoint_path, device, precision, compile=False):
-    model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
-
-    model = model.to(device=device, dtype=precision)
-    logger.info(f"Restored model from checkpoint")
+    model = DualARTransformer.from_pretrained(
+        checkpoint_path, load_weights=True, device=device, dtype=precision
+    )
+    logger.info("Restored model from checkpoint")
 
     if isinstance(model, DualARTransformer):
         decode_one_token = decode_one_token_ar
@@ -402,6 +393,15 @@ def init_model(checkpoint_path, device, precision, compile=False):
     model._cache_setup_done = False
 
     if compile:
+        # Importing torch._inductor costs over a second, so keep it out of
+        # the eager path.
+        from torch._inductor import config as inductor_config
+
+        inductor_config.coordinate_descent_tuning = True
+        inductor_config.triton.unique_kernel_names = True
+        if hasattr(inductor_config, "fx_graph_cache"):
+            inductor_config.fx_graph_cache = True
+
         logger.info("Compiling function...")
         decode_one_token = torch.compile(
             decode_one_token,

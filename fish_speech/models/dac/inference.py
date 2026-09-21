@@ -14,6 +14,8 @@ from omegaconf import OmegaConf
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+from fish_speech.models.dac.modded_dac import Transformer
+from fish_speech.utils.checkpoint import assert_no_meta_tensors
 from fish_speech.utils.file import AUDIO_EXTENSIONS
 
 # register eval resolver
@@ -25,10 +27,15 @@ def load_model(config_name, checkpoint_path, device="cuda"):
     with initialize(version_base="1.3", config_path="../../configs"):
         cfg = compose(config_name=config_name)
 
-    model = instantiate(cfg)
-    state_dict = torch.load(
-        checkpoint_path, map_location=device, mmap=True, weights_only=True
-    )
+    # The meta device skips three 1 GiB causal masks and every random
+    # weight; the checkpoint below supplies the weights and _init_buffers
+    # the masks.
+    with torch.device("meta"):
+        model = instantiate(cfg)
+
+    # No mmap: faulting the pages in reads at roughly 200 MB/s where a
+    # plain read of the same file reaches 10 GB/s.
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
 
@@ -39,9 +46,20 @@ def load_model(config_name, checkpoint_path, device="cuda"):
             if "generator." in k
         }
 
+    # The checkpoint also carries the non-persistent masks. Drop them
+    # before the transfer instead of uploading 0.3 GB the model discards.
+    expected = set(model.state_dict().keys())
+    state_dict = {k: v.to(device) for k, v in state_dict.items() if k in expected}
+
     result = model.load_state_dict(state_dict, strict=False, assign=True)
+
+    for module in model.modules():
+        if isinstance(module, Transformer):
+            module._init_buffers(device)
+
+    assert_no_meta_tensors(model, checkpoint_path)
+
     model.eval()
-    model.to(device)
 
     logger.info(f"Loaded model: {result}")
     return model

@@ -104,21 +104,36 @@ class Transformer(nn.Module):
         )
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
 
-        # Only compute RoPE frequencies if using RoPE
-        if config.pos_embed_type == "rope":
-            freqs_cis = precompute_freqs_cis(
-                327680, self.config.head_dim, self.config.rope_base
-            )
-            self.register_buffer("freqs_cis", freqs_cis, persistent=False)
-        else:
-            self.register_buffer("freqs_cis", None)
-
-        causal_mask = torch.tril(torch.ones(32768, 32768, dtype=torch.bool))
-        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        self._init_buffers()
 
         self.max_batch_size = -1
         self.max_seq_length = -1
         self.use_kv_cache = False
+
+    def _init_buffers(self, device: torch.device | str | None = None) -> None:
+        """Create the RoPE table and the causal mask on `device`.
+
+        Neither buffer is persistent, so no checkpoint restores them and
+        the loader calls this again once the weights have landed.
+        """
+        if self.config.pos_embed_type == "rope":
+            self.register_buffer(
+                "freqs_cis",
+                precompute_freqs_cis(
+                    327680,
+                    self.config.head_dim,
+                    self.config.rope_base,
+                    device=device,
+                ),
+                persistent=False,
+            )
+        else:
+            self.register_buffer("freqs_cis", None)
+
+        pos = torch.arange(32768, device=device)
+        self.register_buffer(
+            "causal_mask", pos[:, None] >= pos[None, :], persistent=False
+        )
 
     def setup_caches(self, max_batch_size, max_seq_length):
         """
@@ -440,10 +455,15 @@ class WindowLimitedTransformer(Transformer):
 
 
 def precompute_freqs_cis(
-    seq_len: int, n_elem: int, base: int = 10000, dtype: torch.dtype = torch.bfloat16
+    seq_len: int,
+    n_elem: int,
+    base: int = 10000,
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | str | None = None,
 ) -> Tensor:
     freqs = 1.0 / (
-        base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
+        base
+        ** (torch.arange(0, n_elem, 2, device=device)[: (n_elem // 2)].float() / n_elem)
     )
     t = torch.arange(seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs)
