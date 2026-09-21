@@ -112,3 +112,7 @@ ffprobe.exe
 # ----------
 /*.test.sh
 asr-label*
+
+# Agent Notes
+# -----------
+/AGENT.md
