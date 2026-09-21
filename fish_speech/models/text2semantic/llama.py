@@ -16,6 +16,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
+from fish_speech.utils.checkpoint import assert_no_meta_tensors
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -246,6 +247,58 @@ def _remap_fish_qwen3_omni_keys(weights: OrderedDict) -> OrderedDict:
     return new_weights
 
 
+def _load_checkpoint_weights(
+    path: Path, device: str | torch.device, dtype: torch.dtype | None
+) -> OrderedDict:
+    """Read the checkpoint under `path` straight onto `device`.
+
+    Staging on the host first doubles the work: the host copy of a bfloat16
+    checkpoint is float32, and the cast back down then runs on the CPU.
+    """
+    index_json = path / "model.safetensors.index.json"
+    single_st = path / "model.safetensors"
+    pth_file = path / "model.pth"
+    device = str(device)
+
+    if index_json.exists() or single_st.exists():
+        from safetensors.torch import load_file as st_load_file
+
+        if index_json.exists():
+            logger.info("Loading sharded safetensors weights")
+            with open(index_json) as f:
+                shards = sorted(set(json.load(f)["weight_map"].values()))
+        else:
+            logger.info("Loading single safetensors weights")
+            shards = [single_st.name]
+
+        weights = OrderedDict()
+        for shard in shards:
+            weights.update(st_load_file(str(path / shard), device=device))
+        weights = _remap_fish_qwen3_omni_keys(weights)
+    elif pth_file.exists():
+        # No mmap. Faulting the pages in reads at roughly 200 MB/s where a
+        # plain read of the same file reaches 10 GB/s.
+        weights = torch.load(pth_file, map_location=device, weights_only=True)
+        if "state_dict" in weights:
+            weights = weights["state_dict"]
+        if weights and next(iter(weights.keys())).startswith("model."):
+            weights = OrderedDict(
+                (k.replace("model.", ""), v) for k, v in weights.items()
+            )
+        for k in list(weights.keys()):
+            if "audio_" in k:
+                weights.pop(k)
+    else:
+        raise FileNotFoundError(f"No model weights found in {path}")
+
+    if dtype is not None:
+        weights = OrderedDict(
+            (k, v.to(dtype) if v.is_floating_point() else v) for k, v in weights.items()
+        )
+
+    return weights
+
+
 class BaseTransformer(nn.Module):
     def __init__(
         self,
@@ -276,26 +329,7 @@ class BaseTransformer(nn.Module):
                 bias=False,
             )
 
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                config.max_seq_len,
-                config.head_dim,
-                config.rope_base,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "causal_mask",
-            torch.tril(
-                torch.ones(
-                    config.max_seq_len,
-                    config.max_seq_len,
-                    dtype=torch.bool,
-                )
-            ),
-            persistent=False,
-        )
+        self._init_buffers()
 
         # For kv cache
         self.max_batch_size = -1
@@ -303,6 +337,27 @@ class BaseTransformer(nn.Module):
 
         if init_weights:
             self.apply(self._init_weights)
+
+    def _init_buffers(self, device: torch.device | str | None = None) -> None:
+        """Create the RoPE table and the causal mask on `device`.
+
+        Neither buffer is persistent, so no checkpoint restores them and
+        `from_pretrained` calls this again once the weights have landed.
+        """
+        self.register_buffer(
+            "freqs_cis",
+            precompute_freqs_cis(
+                self.config.max_seq_len,
+                self.config.head_dim,
+                self.config.rope_base,
+                device=device,
+            ),
+            persistent=False,
+        )
+        pos = torch.arange(self.config.max_seq_len, device=device)
+        self.register_buffer(
+            "causal_mask", pos[:, None] >= pos[None, :], persistent=False
+        )
 
     def setup_caches(
         self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16
@@ -503,6 +558,8 @@ class BaseTransformer(nn.Module):
         max_length: int | None = None,
         lora_config: LoraConfig | None = None,
         rope_base: int | None = None,
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype | None = None,
     ) -> "BaseTransformer":
         # Import wrapper locally to avoid circular dependency or global import issues
         from fish_speech.tokenizer import FishTokenizer
@@ -538,74 +595,43 @@ class BaseTransformer(nn.Module):
                 raise ValueError(f"Unknown model type: {config.model_type}")
 
         logger.info(f"Loading model from {path}, config: {config}")
-        # Initialize model without passing tokenizer explicitly to __init__
-        model = model_cls(config)
-        # Attach tokenizer to model instance for inference convenience (optional, but good for user scripts)
-        model.tokenizer = tokenizer
 
         if load_weights is False:
+            model = model_cls(config)
             logger.info("Randomly initialized model")
         else:
-            if "int8" in str(Path(path)):
-                logger.info("Using int8 weight-only quantization!")
-                from tools.llama.quantize import WeightOnlyInt8QuantHandler
+            # Build on the meta device. Drawing random values for several
+            # billion parameters costs minutes, and the checkpoint below
+            # overwrites every one of them.
+            with torch.device("meta"):
+                model = model_cls(config, init_weights=False)
 
-                simple_quantizer = WeightOnlyInt8QuantHandler(model)
-                model = simple_quantizer.convert_for_runtime()
+                if "int8" in str(Path(path)):
+                    logger.info("Using int8 weight-only quantization!")
+                    from tools.llama.quantize import WeightOnlyInt8QuantHandler
 
-            if "int4" in str(Path(path)):
-                logger.info("Using int4 quantization!")
-                path_comps = path.name.split("-")
-                assert path_comps[-2].startswith("g")
-                groupsize = int(path_comps[-2][1:])
-                from tools.llama.quantize import WeightOnlyInt4QuantHandler
+                    model = WeightOnlyInt8QuantHandler(model).convert_for_runtime()
 
-                simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
-                model = simple_quantizer.convert_for_runtime()
+                if "int4" in str(Path(path)):
+                    logger.info("Using int4 quantization!")
+                    path_comps = Path(path).name.split("-")
+                    assert path_comps[-2].startswith("g")
+                    groupsize = int(path_comps[-2][1:])
+                    from tools.llama.quantize import WeightOnlyInt4QuantHandler
 
-            path_obj = Path(path)
-            index_json = path_obj / "model.safetensors.index.json"
-            single_st = path_obj / "model.safetensors"
-            pth_file = path_obj / "model.pth"
+                    model = WeightOnlyInt4QuantHandler(
+                        model, groupsize
+                    ).convert_for_runtime()
 
-            if index_json.exists():
-                logger.info("Loading sharded safetensors weights")
-                from safetensors.torch import load_file as st_load_file
-
-                with open(index_json) as f:
-                    st_index = json.load(f)
-                shard_files = sorted(set(st_index["weight_map"].values()))
-                weights = OrderedDict()
-                for shard in shard_files:
-                    weights.update(st_load_file(str(path_obj / shard), device="cpu"))
-                weights = _remap_fish_qwen3_omni_keys(weights)
-            elif single_st.exists():
-                logger.info("Loading single safetensors weights")
-                from safetensors.torch import load_file as st_load_file
-
-                weights = OrderedDict(st_load_file(str(single_st), device="cpu"))
-                weights = _remap_fish_qwen3_omni_keys(weights)
-            elif pth_file.exists():
-                weights = torch.load(
-                    pth_file,
-                    map_location="cpu",
-                    mmap=True,
-                    weights_only=True,
-                )
-                if "state_dict" in weights:
-                    weights = weights["state_dict"]
-                if weights and next(iter(weights.keys())).startswith("model."):
-                    weights = OrderedDict(
-                        (k.replace("model.", ""), v) for k, v in weights.items()
-                    )
-                for k in list(weights.keys()):
-                    if "audio_" in k:
-                        weights.pop(k)
-            else:
-                raise FileNotFoundError(f"No model weights found in {path_obj}")
-
+            weights = _load_checkpoint_weights(Path(path), device, dtype)
             err = model.load_state_dict(weights, strict=False, assign=True)
             logger.info(f"Model weights loaded - Status: {err}")
+
+            model._init_buffers(device)
+            assert_no_meta_tensors(model, path)
+
+        # Attach tokenizer to model instance for inference convenience
+        model.tokenizer = tokenizer
 
         if lora_config is not None:
             setup_lora(model, lora_config)
@@ -632,7 +658,7 @@ class BaseTransformer(nn.Module):
 
 
 class NaiveTransformer(BaseTransformer):
-    def __init__(self, config: NaiveModelArgs) -> None:
+    def __init__(self, config: NaiveModelArgs, init_weights: bool = True) -> None:
         super().__init__(config, init_weights=False)
 
         self.codebook_norm = RMSNorm(config.dim, eps=config.norm_eps)
@@ -642,7 +668,8 @@ class NaiveTransformer(BaseTransformer):
             bias=False,
         )
 
-        self.apply(self._init_weights)
+        if init_weights:
+            self.apply(self._init_weights)
 
     def decode(self, result: BaseTransformerForwardResult) -> TransformerForwardResult:
         token_logits = result.logits
@@ -681,7 +708,7 @@ class NaiveTransformer(BaseTransformer):
 
 
 class DualARTransformer(BaseTransformer):
-    def __init__(self, config: NaiveModelArgs) -> None:
+    def __init__(self, config: DualARModelArgs, init_weights: bool = True) -> None:
         super().__init__(config, init_weights=False)
 
         # Project to fast dim if needed
@@ -717,16 +744,21 @@ class DualARTransformer(BaseTransformer):
             bias=False,
         )
 
+        if init_weights:
+            self.apply(self._init_weights)
+
+    def _init_buffers(self, device: torch.device | str | None = None) -> None:
+        super()._init_buffers(device)
         self.register_buffer(
             "fast_freqs_cis",
             precompute_freqs_cis(
-                config.num_codebooks,
-                config.fast_head_dim,
-                config.rope_base,
+                self.config.num_codebooks,
+                self.config.fast_head_dim,
+                self.config.rope_base,
+                device=device,
             ),
             persistent=False,
         )
-        self.apply(self._init_weights)
 
     def setup_caches(
         self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16
@@ -1037,7 +1069,12 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor:
+def precompute_freqs_cis(
+    seq_len: int,
+    n_elem: int,
+    base: int = 10000,
+    device: torch.device | str | None = None,
+) -> Tensor:
     """
     Precomputes frequency tensors for complex exponentials (cis)
 
@@ -1050,7 +1087,8 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor
         A tensor containing the precomputed frequencies in real and imaginary parts (bfloat16).
     """
     freqs = 1.0 / (
-        base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
+        base
+        ** (torch.arange(0, n_elem, 2, device=device)[: (n_elem // 2)].float() / n_elem)
     )
     t = torch.arange(seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs)
